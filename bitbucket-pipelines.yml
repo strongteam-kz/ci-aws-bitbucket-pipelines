@@ -1,0 +1,92 @@
+image:
+  name: node:alpine
+
+pipelines:
+  pull-requests:
+    '**':
+      - step:
+          name: Build PR version
+          caches:
+            - node
+          script:
+            - export NODE_OPTIONS="--max_old_space_size=1536"
+            # initial configuration
+            - apk update && apk add git
+            - npm install
+            # preparing site footer text
+            - TIMESTAMP_FILE="./src/app/some/folder/copyright.timestamp.html"
+            - GIT_AUTHOR=$(git log -n 1 --format=format:'%an')
+            - PR_URL="$BITBUCKET_GIT_HTTP_ORIGIN/pull-requests/$BITBUCKET_PR_ID"
+            - BRANCH_TEXT="PR branch <a href=\"$PR_URL\">$BITBUCKET_BRANCH</a><br>"
+            - echo $BRANCH_TEXT >> $TIMESTAMP_FILE
+            - echo "Author $GIT_AUTHOR<br>" >> $TIMESTAMP_FILE
+            - echo "Built at $(TZ=UTC-6 date '+%d-%m-%Y %H:%M') <br>" >> $TIMESTAMP_FILE
+            - echo "</small>" >> $TIMESTAMP_FILE
+            - cat $TIMESTAMP_FILE > src/app/target/folder/copyright.component.html
+            # building artefacts
+            - npm run build
+          artifacts:
+            paths:
+              - dist/jysan/**
+
+      - step:
+          name: Deploy PR version into AWS bucket for QA
+          image:
+            name: amazon/aws-cli
+          script:
+            # Assuming you have configured pipeline ENV variables
+            # - AWS_ACCESS_KEY_ID
+            # - AWS_SECRET_ACCESS_KEY
+            # 1. Login to AWS via CLI command
+            - aws configure set aws_access_key_id=$AWS_ACCESS_KEY_ID aws_secret_access_key=$AWS_SECRET_ACCESS_KEY
+            # 2. определяем название для динамического бакета по спец-формату 
+            - export BUCKET_NAME=web-pullrequest-$BITBUCKET_PR_ID
+            # 3. если в AWS нету бакета с таким названием, создаем его с нужными флагами
+            - if [ -z $(aws s3 ls | grep $BUCKET_NAME) ]; then aws s3api create-bucket --bucket $BUCKET_NAME --acl public-read --region ap-northeast-2 --create-bucket-configuration LocationConstraint=ap-northeast-2; fi
+            # 4. задаем это бакету настройку статичного хостинга
+            - aws s3api put-bucket-website --website-configuration "{\"ErrorDocument\":{\"Key\":\"error.html\"},\"IndexDocument\":{\"Suffix\":\"index.html\"}}" --bucket $BUCKET_NAME
+            # 5. очищаем содержимое бакета
+            - aws s3 rm s3://$BUCKET_NAME --recursive 
+            # 5. заливаем в него собранные html/css/js
+            - aws s3 cp dist/jysan s3://$BUCKET_NAME --acl public-read --recursive
+            # 6. Пишем коммент со ссылкой от имени сервисной учетки в нужный пулл реквест
+            - export PR_API_URL=https://api.bitbucket.org/2.0/repositories/$BITBUCKET_REPO_FULL_NAME/pullrequests/$BITBUCKET_PR_ID/comments
+            - export BUCKET_PUBLIC_URL=http://$BUCKET_NAME.s3-website.ap-northeast-2.amazonaws.com
+            - curl $PR_API_URL -u $CI_STRONG_USERNAME:$CI_STRONG_APP_PASSWORD --request POST --header 'Content-Type:application/json' --data "{\"content\":{\"raw\":\"[http://$BUCKET_NAME.s3-website.ap-northeast-2.amazonaws.com](http://$BUCKET_NAME.s3-website.ap-northeast-2.amazonaws.com)\"}}"
+
+  branches:
+    '{master}':
+      - step:
+          name: Build and deploy stable docker image into Hub
+          caches:
+            - node
+          services:
+            - docker
+          script:
+            - export NODE_OPTIONS="--max_old_space_size=1536"
+            - echo "$DOCKERHUB_PASSWORD" | docker login -u $DOCKERHUB_USERNAME --password-stdin
+            - npm install
+            - npm run build
+            - docker build -t $DOCKERHUB_REPO_NAME:$BITBUCKET_COMMIT --build-arg app_version_text=$BITBUCKET_BRANCH_$BITBUCKET_COMMIT .
+            - docker push $DOCKERHUB_REPO_NAME:$BITBUCKET_COMMIT
+      - step:
+          name: Remove dangling s3 buckets left after PR merges
+          image:
+              name: amazon/aws-cli
+          script:
+            # 1. Запросить список 10 последних MERGED пулл реквестов
+            - export API_URL="https://api.bitbucket.org/2.0/repositories/$BITBUCKET_REPO_FULL_NAME/pullrequests?state=MERGED"
+            - curl "$API_URL" -u $CI_STRONG_USERNAME:$CI_STRONG_APP_PASSWORD > pr_list.json
+            # 2. выделить бакеты, соответствующие спец-формату 
+            - aws s3 ls | grep -o '[a-zA-Z\-]\+pullrequest\-[0-9]\+' > buckets.txt
+            - set +e
+            # очистить все бакеты с номер ПР-ок, которые уже MERGED
+            # (AWS API требует очистки бакета перед его полным удалением)
+            - echo "$(cat pr_list.json | grep -o '"id":\s[0-9]\+')" | sed 's/[^0-9]//g' | xargs -I{} grep {} buckets.txt | xargs -I{} aws s3 rm s3://{} --recursive
+            # удалить все бакеты с номер ПР-ок, которые уже MERGED
+            - echo "$(cat pr_list.json | grep -o '"id":\s[0-9]\+')" | sed 's/[^0-9]//g' | xargs -I{} grep {} buckets.txt | xargs -I{} aws s3api delete-bucket --bucket {}
+
+definitions:
+  services:
+    docker:
+      memory: 1024  # docker memory limit to 1GB
